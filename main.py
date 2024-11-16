@@ -71,6 +71,7 @@ async def get_generated_text(prompt: str, model: str):
 # Endpoint for /generate that handles both streaming and non-streaming
 @app.post("/api/generate")
 async def generate_text(query: Query):
+    print(f"Solicitud recibida: {query}")
     if query.stream:
         return StreamingResponse(
             stream_generated_text(query.prompt, query.model),
