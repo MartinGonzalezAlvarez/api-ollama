@@ -2,153 +2,160 @@ import os
 import json
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, AsyncGenerator
 import httpx
+from starlette.responses import Response
 
 app = FastAPI()
 
+# Configurar CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # En producción, especifica los orígenes permitidos
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Obtener la URL del servidor LLM desde una variable de entorno
-LLM_SERVER_URL = os.environ.get("LLM_SERVER_URL", "http://localhost:11434")  
+LLM_SERVER_URL = os.environ.get("LLM_SERVER_URL", "http://localhost:11434")
 
 class Query(BaseModel):
-    """
-    Modelo para las solicitudes a la API.
-    """
+    """Modelo para las solicitudes a la API."""
     prompt: str
     model: str = "llama2"
-    stream: Optional[bool] = True  # Por defecto, se utiliza streaming
+    stream: Optional[bool] = True
 
-# Async generator para extraer "response" de /api/generate (Streaming)
-async def stream_generated_text(prompt: str, model: str):
+async def stream_response(response: httpx.Response) -> AsyncGenerator[str, None]:
     """
-    Genera texto de forma asíncrona a partir del modelo de lenguaje.
-
+    Procesa la respuesta streaming de forma segura.
+    
     Args:
-        prompt (str): El prompt para el modelo.
-        model (str): El nombre del modelo a utilizar.
-
+        response: La respuesta de httpx en modo streaming
+        
     Yields:
-        str: Fragmentos de la respuesta del modelo.
+        str: Fragmentos de la respuesta procesada
     """
-    url = f"{LLM_SERVER_URL}/api/generate"
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            async with client.stream("POST", url, json={"model": model, "prompt": prompt}) as response:
-                if response.status_code != 200:
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail=f"Error al conectar con el servidor LLM: {response.status_code} - {response.text}"
-                    )
-
-                # Se itera sobre los fragmentos de la respuesta y se extrae el contenido de "response"
-                async for chunk in response.aiter_bytes():
+    try:
+        async for chunk in response.aiter_bytes():
+            if chunk:
+                try:
                     decoded_chunk = chunk.decode('utf-8')
-                    for line in decoded_chunk.split("\n\n"):
+                    for line in decoded_chunk.split('\n'):
                         if line.strip():
                             try:
                                 data = json.loads(line)
                                 if "response" in data:
                                     yield data["response"]
                             except json.JSONDecodeError:
-                                continue  # Se ignoran los fragmentos JSON inválidos
+                                continue
+                except UnicodeDecodeError:
+                    continue
+    except httpx.HTTPError as e:
+        yield f"Error durante el streaming: {str(e)}"
+    except Exception as e:
+        yield f"Error inesperado: {str(e)}"
 
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=500, detail=f"Error de comunicación con el servidor LLM: {e}")
-
-# Función auxiliar para obtener la respuesta completa de /api/generate (sin streaming)
-async def get_generated_text(prompt: str, model: str):
+async def stream_generated_text(prompt: str, model: str) -> AsyncGenerator[str, None]:
     """
-    Obtiene el texto completo generado por el modelo de lenguaje.
-
+    Genera texto de forma asíncrona a partir del modelo de lenguaje.
+    
     Args:
-        prompt (str): El prompt para el modelo.
-        model (str): El nombre del modelo a utilizar.
-
-    Returns:
-        dict: Un diccionario con la respuesta del modelo.
+        prompt: El prompt para el modelo
+        model: El nombre del modelo a utilizar
+        
+    Yields:
+        str: Fragmentos de la respuesta del modelo
     """
     url = f"{LLM_SERVER_URL}/api/generate"
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            response = await client.post(url, json={"model": model, "prompt": prompt})
-            response.raise_for_status()
-
-            # Se combinan todas las respuestas en una sola cadena
-            combined_response = ""
-            for line in response.text.splitlines():
-                if line.strip():
+    
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("POST", url, json={"model": model, "prompt": prompt}) as response:
+                if response.status_code != 200:
+                    # Leer el contenido del error de forma segura
+                    error_content = await response.aread()
                     try:
-                        data = json.loads(line)
-                        if "response" in data:
-                            combined_response += data["response"]
-                    except json.JSONDecodeError:
-                        continue  # Se ignoran los fragmentos JSON inválidos
+                        error_text = error_content.decode('utf-8')
+                    except UnicodeDecodeError:
+                        error_text = "Error al decodificar la respuesta"
+                        
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=f"Error al conectar con el servidor LLM: {response.status_code} - {error_text}"
+                    )
+                
+                async for text in stream_response(response):
+                    yield text
 
-            return {"response": combined_response}
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error de comunicación con el servidor LLM: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error inesperado: {str(e)}"
+        )
 
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=500, detail=f"Error de comunicación con el servidor LLM: {e}")
-
-# Endpoint para /generate que maneja tanto streaming como no streaming
 @app.post("/api/generate")
-async def generate_text(query: Query):
+async def generate_text(query: Query) -> Response:
     """
     Endpoint para generar texto a partir de un prompt.
-
+    
     Args:
-        query (Query): La solicitud con el prompt y la configuración.
-
+        query: La solicitud con el prompt y la configuración
+        
     Returns:
-        StreamingResponse o JSONResponse: La respuesta del modelo, en streaming o completa.
+        StreamingResponse o JSONResponse según la configuración
     """
     if query.stream:
         return StreamingResponse(
             stream_generated_text(query.prompt, query.model),
-            media_type="text/plain"
+            media_type="text/plain",
         )
     else:
-        response = await get_generated_text(query.prompt, query.model)
-        return JSONResponse(response)
+        # Para respuestas no streaming
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    f"{LLM_SERVER_URL}/api/generate",
+                    json={"model": query.model, "prompt": query.prompt}
+                )
+                response.raise_for_status()
+                return JSONResponse(response.json())
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error al generar respuesta: {str(e)}"
+            )
 
-# Endpoint para /models/download que maneja la descarga de modelos
 @app.post("/api/models/download")
 async def download_model(llm_name: str = Body(..., embed=True)):
-    """
-    Endpoint para descargar un modelo de lenguaje.
-
-    Args:
-        llm_name (str): El nombre del modelo a descargar.
-
-    Returns:
-        dict: Un diccionario con un mensaje de éxito o error.
-    """
+    """Endpoint para descargar un modelo de lenguaje."""
     url = f"{LLM_SERVER_URL}/api/pull"
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json={"name": llm_name})
-            response.raise_for_status()  # Lanza una excepción si la solicitud falla
+            response.raise_for_status()
             return {"message": f"Model {llm_name} downloaded successfully"}
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=500, detail=f"Error al descargar el modelo: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al descargar el modelo: {str(e)}")
 
-# Endpoint para /models que lista los modelos disponibles
 @app.get("/api/models")
 async def list_models():
-    """
-    Endpoint para listar los modelos de lenguaje disponibles.
-
-    Returns:
-        dict: Un diccionario con la lista de modelos.
-    """
+    """Endpoint para listar los modelos disponibles."""
     url = f"{LLM_SERVER_URL}/api/tags"
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(url)
-            response.raise_for_status()  # Lanza una excepción si la solicitud falla
+            response.raise_for_status()
             return {"models": response.json()["models"]}
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=500, detail=f"Error al obtener la lista de modelos: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al obtener la lista de modelos: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
