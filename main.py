@@ -1,3 +1,4 @@
+import os
 import json
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -7,50 +8,79 @@ import httpx
 
 app = FastAPI()
 
+# Obtener la URL del servidor LLM desde una variable de entorno
+LLM_SERVER_URL = os.environ.get("LLM_SERVER_URL", "http://localhost:11434")  
+
 class Query(BaseModel):
+    """
+    Modelo para las solicitudes a la API.
+    """
     prompt: str
-    model: str = "llama2"
-    stream: Optional[bool] = True  # Default to streaming
+    model: str = "mistral:7b"  # Cambiado el modelo por defecto a mistral
+    stream: Optional[bool] = True
 
-
-# Async generator for extracting "response" from /api/generate (Streaming)
-async def stream_generated_text(prompt: str, model: str):
-    url = "http://localhost:11434/api/generate"
+async def stream_generated_text(prompt: str, model: str = "mistral:7b"):
+    """
+    Genera texto de forma asíncrona usando Mistral.
+    """
+    url = f"{LLM_SERVER_URL}/api/generate"
     async with httpx.AsyncClient(timeout=60.0) as client:
         try:
-            async with client.stream(
-                "POST", url, json={"model": model, "prompt": prompt}
-            ) as response:
+            # Configuración específica para Mistral
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "stream": True,
+                "options": {
+                    "temperature": 0.7,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                }
+            }
+            
+            async with client.stream("POST", url, json=payload) as response:
                 if response.status_code != 200:
                     raise HTTPException(
                         status_code=response.status_code,
-                        detail="Failed to connect to the model server."
+                        detail=f"Error al conectar con el servidor LLM: {response.status_code} - {response.text}"
                     )
 
-                # Yield only the raw "response" content from the JSON objects
                 async for chunk in response.aiter_bytes():
                     decoded_chunk = chunk.decode('utf-8')
-                    for line in decoded_chunk.split("\n\n"):
+                    for line in decoded_chunk.split("\n"):
                         if line.strip():
                             try:
                                 data = json.loads(line)
                                 if "response" in data:
                                     yield data["response"]
                             except json.JSONDecodeError:
-                                continue  # Skip invalid JSON
+                                continue
 
         except httpx.RequestError as e:
-            raise HTTPException(status_code=500, detail=f"Error communicating with the server: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error de comunicación con el servidor LLM: {e}")
 
-# Helper function for non-streaming response from /api/generate
-async def get_generated_text(prompt: str, model: str):
-    url = "http://localhost:11434/api/generate"
+async def get_generated_text(prompt: str, model: str = "mistral:7b"):
+    """
+    Obtiene el texto completo generado por Mistral.
+    """
+    url = f"{LLM_SERVER_URL}/api/generate"
     async with httpx.AsyncClient(timeout=60.0) as client:
         try:
-            response = await client.post(url, json={"model": model, "prompt": prompt})
+            # Configuración específica para Mistral
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                }
+            }
+            
+            response = await client.post(url, json=payload)
             response.raise_for_status()
 
-            # Combine all responses into a single string
             combined_response = ""
             for line in response.text.splitlines():
                 if line.strip():
@@ -59,19 +89,16 @@ async def get_generated_text(prompt: str, model: str):
                         if "response" in data:
                             combined_response += data["response"]
                     except json.JSONDecodeError:
-                        continue  # Skip invalid JSON
+                        continue
 
             return {"response": combined_response}
 
         except httpx.RequestError as e:
-            raise HTTPException(status_code=500, detail=f"Error communicating with the server: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error de comunicación con el servidor LLM: {e}")
 
-# Async generator for extracting "response" from /api/chat (Streaming)
-
-# Endpoint for /generate that handles both streaming and non-streaming
+# Los endpoints permanecen iguales
 @app.post("/api/generate")
 async def generate_text(query: Query):
-    print(f"Solicitud recibida: {query}")
     if query.stream:
         return StreamingResponse(
             stream_generated_text(query.prompt, query.model),
@@ -81,30 +108,28 @@ async def generate_text(query: Query):
         response = await get_generated_text(query.prompt, query.model)
         return JSONResponse(response)
 
-# Endpoint for /chat that handles both streaming and non-streaming
 @app.post("/api/models/download")
 async def download_model(llm_name: str = Body(..., embed=True)):
+    url = f"{LLM_SERVER_URL}/api/pull"
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "http://localhost:11434/api/pull",
-                json={"name": llm_name}
-            )
+            response = await client.post(url, json={"name": llm_name})
             response.raise_for_status()
             return {"message": f"Model {llm_name} downloaded successfully"}
     except httpx.RequestError as e:
-        raise HTTPException(status_code=500, detail=f"Error downloading model: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al descargar el modelo: {e}")
 
 @app.get("/api/models")
 async def list_models():
+    url = f"{LLM_SERVER_URL}/api/tags"
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get("http://localhost:11434/api/tags")
+            response = await client.get(url)
             response.raise_for_status()
             return {"models": response.json()["models"]}
     except httpx.RequestError as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching models: {str(e)}")
-    
+        raise HTTPException(status_code=500, detail=f"Error al obtener la lista de modelos: {e}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=3335)
