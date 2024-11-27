@@ -19,7 +19,7 @@ class Query(BaseModel):
     model: str = "mistral:7b"  # Cambiado el modelo por defecto a mistral
     stream: Optional[bool] = True
 
-async def stream_generated_text(prompt: str, model: str = "mistral:7b"):
+async def stream_generated_text(prompt: str, model: str = "llama3.2:3b"):
     """
     Genera texto de forma asíncrona usando Mistral.
     """
@@ -59,7 +59,7 @@ async def stream_generated_text(prompt: str, model: str = "mistral:7b"):
         except httpx.RequestError as e:
             raise HTTPException(status_code=500, detail=f"Error de comunicación con el servidor LLM: {e}")
 
-async def get_generated_text(prompt: str, model: str = "mistral:7b"):
+async def get_generated_text(prompt: str, model: str = "llama3.2:3b"):
     """
     Obtiene el texto completo generado por Mistral.
     """
